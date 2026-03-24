@@ -28,10 +28,17 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.fixture(scope="module")
-def uma_predict_unit():
-    """Get a UMA predict unit for testing."""
+def uma_model_key():
+    """Get a UMA model key for testing."""
     uma_models = [name for name in pretrained_mlip.available_models if "uma" in name]
-    return pretrained_mlip.get_predict_unit(uma_models[0])
+    return f"{uma_models[0]}:default"
+
+
+@pytest.fixture(scope="module")
+def uma_predict_unit(uma_model_key):
+    """Get a UMA predict unit for testing (for serial comparison)."""
+    model_name = uma_model_key.split(":")[0]
+    return pretrained_mlip.get_predict_unit(model_name)
 
 
 def setup_ray():
@@ -62,9 +69,8 @@ def cleanup_ray():
 
 
 @pytest.fixture()
-def inference_batcher(uma_predict_unit):
+def inference_batcher(uma_model_key):
     batcher = InferenceBatcher(
-        predict_unit=uma_predict_unit,
         max_batch_size=8,
         batch_wait_timeout_s=0.05,
         num_replicas=1,
@@ -72,17 +78,16 @@ def inference_batcher(uma_predict_unit):
         concurrency_backend_options={"max_workers": 4},
     )
 
-    yield batcher
+    yield batcher, uma_model_key
 
     cleanup_ray()
 
 
 @pytest.mark.gpu()
-def test_initialization_with_custom_concurrency_options(uma_predict_unit):
+def test_initialization_with_custom_concurrency_options():
     try:
         max_workers = 8
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=16,
             batch_wait_timeout_s=0.1,
             num_replicas=1,
@@ -96,10 +101,9 @@ def test_initialization_with_custom_concurrency_options(uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_initialization_with_ray_actor_options(uma_predict_unit):
+def test_initialization_with_ray_actor_options():
     try:
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=16,
             batch_wait_timeout_s=0.1,
             num_replicas=1,
@@ -112,10 +116,9 @@ def test_initialization_with_ray_actor_options(uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_context_manager_enter_exit(uma_predict_unit):
+def test_context_manager_enter_exit():
     try:
         with InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=16,
             batch_wait_timeout_s=0.1,
             num_replicas=1,
@@ -137,6 +140,9 @@ def test_context_manager_enter_exit(uma_predict_unit):
 @pytest.mark.gpu()
 def test_batched_atomic_data_predictions(inference_batcher):
     """Test batched predictions using AtomicData directly."""
+    batcher, model_key = inference_batcher
+    predict_unit = batcher.get_predict_unit(model_key)
+
     atoms_list = [bulk("Cu"), bulk("Al"), bulk("Fe")]
     atomic_data_list = [
         AtomicData.from_ase(atoms, task_name="omat") for atoms in atoms_list
@@ -144,8 +150,7 @@ def test_batched_atomic_data_predictions(inference_batcher):
 
     with ThreadPoolExecutor(max_workers=len(atoms_list)) as executor:
         futures = [
-            executor.submit(inference_batcher.batch_predict_unit.predict, data)
-            for data in atomic_data_list
+            executor.submit(predict_unit.predict, data) for data in atomic_data_list
         ]
         results = [future.result() for future in futures]
 
@@ -160,6 +165,9 @@ def test_batched_atomic_data_predictions(inference_batcher):
 @pytest.mark.gpu()
 def test_batch_vs_serial_consistency(inference_batcher, uma_predict_unit):
     """Test that batched and serial calculations produce consistent results."""
+    batcher, model_key = inference_batcher
+    batch_predict_unit = batcher.get_predict_unit(model_key)
+
     atoms_list = [
         bulk("Cu"),
         bulk("Al"),
@@ -175,10 +183,10 @@ def test_batch_vs_serial_consistency(inference_batcher, uma_predict_unit):
         }
 
     results_batched = list(
-        inference_batcher.executor.map(
+        batcher.executor.map(
             partial(
                 calculate_properties,
-                predict_unit=inference_batcher.batch_predict_unit,
+                predict_unit=batch_predict_unit,
             ),
             atoms_list,
         )
@@ -195,13 +203,12 @@ def test_batch_vs_serial_consistency(inference_batcher, uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_initialization_with_processes_backend(uma_predict_unit):
+def test_initialization_with_processes_backend():
     """Test initialization with ProcessPoolExecutor backend."""
     try:
         from concurrent.futures import ProcessPoolExecutor
 
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=16,
             batch_wait_timeout_s=0.1,
             num_replicas=1,
@@ -215,13 +222,12 @@ def test_initialization_with_processes_backend(uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_initialization_with_ray_actors_backend(uma_predict_unit):
+def test_initialization_with_ray_actors_backend():
     """Test initialization with Ray actor pool backend."""
     try:
         from fairchem.core.calculate._batch import RayActorPoolExecutor
 
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=16,
             batch_wait_timeout_s=0.1,
             num_replicas=1,
@@ -235,7 +241,7 @@ def test_initialization_with_ray_actors_backend(uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_autobatch_config_initialization(uma_predict_unit):
+def test_autobatch_config_initialization(uma_model_key):
     """Test initialization and auto_configure_batching method."""
     try:
         autobatch_config = AutobatchConfig(
@@ -246,7 +252,6 @@ def test_autobatch_config_initialization(uma_predict_unit):
         )
 
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             split_oom_batch=True,
             num_replicas=1,
         )
@@ -255,7 +260,11 @@ def test_autobatch_config_initialization(uma_predict_unit):
         probe_data = [AtomicData.from_ase(bulk("Cu"), task_name="omat")]
 
         # Configure autobatch with probe data
-        result = batcher.auto_configure_batching(probe_data, config=autobatch_config)
+        result = batcher.auto_configure_batching(
+            model_key=uma_model_key,
+            probe_data=probe_data,
+            config=autobatch_config,
+        )
 
         # Autobatch should return a result with max_batch_size and timeout
         assert result.max_batch_size >= autobatch_config.min_batch_size
@@ -265,11 +274,10 @@ def test_autobatch_config_initialization(uma_predict_unit):
 
 
 @pytest.mark.gpu()
-def test_batcher_with_explicit_values(uma_predict_unit):
+def test_batcher_with_explicit_values(uma_model_key):
     """Test that explicit batch size and timeout values are used."""
     try:
         batcher = InferenceBatcher(
-            predict_unit=uma_predict_unit,
             max_batch_size=256,
             batch_wait_timeout_s=0.2,
             num_replicas=1,
@@ -277,30 +285,103 @@ def test_batcher_with_explicit_values(uma_predict_unit):
 
         # Batcher should be created successfully with explicit values
         assert hasattr(batcher, "predict_server_handle")
-        assert hasattr(batcher, "batch_predict_unit")
+
+        # Should be able to get a predict unit
+        predict_unit = batcher.get_predict_unit(uma_model_key)
+        assert predict_unit is not None
     finally:
         cleanup_ray()
 
 
-def test_probe_optimal_batch_size_cpu():
+def test_probe_optimal_batch_size_cpu(uma_model_key):
     """Test probing on CPU returns defaults."""
     from fairchem.core.units.mlip_unit._batch_serve import (
         AutobatchConfig,
         probe_optimal_batch_size,
     )
 
-    # Create a mock predict unit with CPU device
-    class MockPredictUnit:
-        device = "cpu"
-
-        def predict(self, data, undo_element_references=True):
-            return {"energy": torch.tensor([0.0])}
-
     config = AutobatchConfig()
     # Create probe data for the test
     probe_data = [AtomicData.from_ase(bulk("Cu"), task_name="omat")]
-    result = probe_optimal_batch_size(MockPredictUnit(), probe_data, config)
+    result = probe_optimal_batch_size(
+        model_key=uma_model_key,
+        probe_data=probe_data,
+        config=config,
+        device="cpu",
+    )
 
     # CPU should return defaults
     assert result.max_batch_size == config.min_batch_size
     assert result.batch_wait_timeout_s == config.timeout_ceil_s
+
+
+@pytest.mark.gpu()
+def test_get_predict_unit_returns_batch_server_predict_unit(uma_model_key):
+    """Test that get_predict_unit returns a properly configured BatchServerPredictUnit."""
+    try:
+        from fairchem.core.units.mlip_unit.predict import BatchServerPredictUnit
+
+        batcher = InferenceBatcher(
+            max_batch_size=16,
+            batch_wait_timeout_s=0.1,
+            num_replicas=1,
+        )
+
+        predict_unit = batcher.get_predict_unit(uma_model_key)
+
+        assert isinstance(predict_unit, BatchServerPredictUnit)
+        assert predict_unit._model_key == uma_model_key
+    finally:
+        cleanup_ray()
+
+
+@pytest.mark.gpu()
+def test_multiple_models_same_batcher():
+    """Test that multiple models can be used with the same batcher."""
+    try:
+        uma_models = [
+            name for name in pretrained_mlip.available_models if "uma" in name
+        ]
+        if len(uma_models) < 2:
+            pytest.skip("Need at least 2 UMA models for this test")
+
+        model_key_1 = f"{uma_models[0]}:default"
+        model_key_2 = f"{uma_models[1]}:default" if len(uma_models) > 1 else model_key_1
+
+        batcher = InferenceBatcher(
+            max_batch_size=16,
+            batch_wait_timeout_s=0.1,
+            num_replicas=1,
+            max_num_models_per_replica=3,
+        )
+
+        unit_1 = batcher.get_predict_unit(model_key_1)
+        unit_2 = batcher.get_predict_unit(model_key_2)
+
+        # Both should be usable
+        assert unit_1._model_key == model_key_1
+        assert unit_2._model_key == model_key_2
+
+        # Should share the same server handle
+        assert unit_1._handle is unit_2._handle
+    finally:
+        cleanup_ray()
+
+
+@pytest.mark.gpu()
+def test_autoscaling_config():
+    """Test that autoscaling configuration is accepted."""
+    try:
+        batcher = InferenceBatcher(
+            max_batch_size=16,
+            batch_wait_timeout_s=0.1,
+            autoscaling_config={
+                "min_replicas": 1,
+                "max_replicas": 2,
+                "target_ongoing_requests": 2,
+            },
+        )
+
+        assert hasattr(batcher, "predict_server_handle")
+    finally:
+        cleanup_ray()

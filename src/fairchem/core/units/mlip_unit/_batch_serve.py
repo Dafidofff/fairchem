@@ -7,9 +7,10 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any
@@ -82,7 +83,6 @@ def _expand_probe_data(
     if not data_list:
         raise ValueError("data_list cannot be empty")
 
-    # Calculate total atoms in the provided data
     base_num_atoms = sum(data.natoms.sum().item() for data in data_list)
 
     if base_num_atoms >= target_num_atoms:
@@ -98,9 +98,10 @@ def _expand_probe_data(
 
 
 def probe_optimal_batch_size(
-    predict_unit: MLIPPredictUnit,
+    model_key: str,
     probe_data: list[AtomicData],
     config: AutobatchConfig | None = None,
+    device: str = "cuda",
 ) -> AutobatchResult:
     """Probe for optimal batch size and timeout using runtime GPU memory behavior.
 
@@ -109,22 +110,24 @@ def probe_optimal_batch_size(
     batch wait timeout from observed latencies.
 
     Args:
-        predict_unit: The MLIPPredictUnit to probe with.
+        model_key: Model key in format "{checkpoint_path_or_name}:{inference_settings}".
         probe_data: List of AtomicData objects to use for probing. If the total
             number of atoms is less than the target batch size being probed,
             the data will be repeated to reach the target size.
         config: Autobatch configuration. Uses defaults if None.
+        device: Device to load the model on for probing.
 
     Returns:
         AutobatchResult with optimal parameters.
     """
+    from fairchem.core.calculate import pretrained_mlip
+    from fairchem.core.units.mlip_unit import load_predict_unit
+
     if config is None:
         config = AutobatchConfig()
 
     if not probe_data:
         raise ValueError("probe_data cannot be empty")
-
-    device = predict_unit.device
 
     # For CPU, use conservative defaults
     if "cuda" not in str(device):
@@ -135,9 +138,32 @@ def probe_optimal_batch_size(
             median_latency_s=0.1,
         )
 
-    logging.info("Starting autobatch probing...")
+    # Parse model_key and load model for probing
+    parts = model_key.split(":")
+    checkpoint_name = parts[0]
+    inference_settings = parts[1] if len(parts) > 1 else "default"
 
-    # Get initial GPU memory state
+    is_local_path = (
+        checkpoint_name.endswith(".pt")
+        or "/" in checkpoint_name
+        or "\\" in checkpoint_name
+    )
+
+    if is_local_path:
+        predict_unit = load_predict_unit(
+            checkpoint_name,
+            inference_settings=inference_settings,
+            device=device,
+        )
+    else:
+        predict_unit = pretrained_mlip.get_predict_unit(
+            checkpoint_name,
+            inference_settings=inference_settings,
+            device=device,
+        )
+
+    logging.info(f"Starting autobatch probing for model_key={model_key}...")
+
     free_mem, total_mem = (
         (0, 0) if not torch.cuda.is_available() else torch.cuda.mem_get_info()
     )
@@ -145,7 +171,7 @@ def probe_optimal_batch_size(
         f"GPU memory: {free_mem / 1e9:.2f}GB free / {total_mem / 1e9:.2f}GB total"
     )
 
-    # Warmup the model using the provided probe data
+    # Warmup the model
     logging.info(f"Running {config.warmup_steps} warmup steps...")
     warmup_batch = atomicdata_list_to_batch(probe_data)
     for _ in range(config.warmup_steps):
@@ -172,11 +198,9 @@ def probe_optimal_batch_size(
 
         for step in range(config.probe_steps):
             try:
-                # Expand probe data to reach target batch size by repeating items
                 expanded_data = _expand_probe_data(probe_data, mid)
                 batch = atomicdata_list_to_batch(expanded_data)
 
-                # Time the inference
                 torch.cuda.synchronize()
                 start = time.perf_counter()
                 predict_unit.predict(batch, undo_element_references=False)
@@ -205,11 +229,9 @@ def probe_optimal_batch_size(
             high = mid - 1
             logging.debug(f"  Failed at {mid}, trying smaller...")
 
-    # Apply backoff factor for safety margin
     final_batch_size = int(best_batch_size * config.backoff_factor)
     final_batch_size = max(final_batch_size, config.min_batch_size)
 
-    # Compute timeout from latencies
     if latencies:
         sorted_latencies = sorted(latencies)
         median_latency = sorted_latencies[len(sorted_latencies) // 2]
@@ -231,7 +253,16 @@ def probe_optimal_batch_size(
         f"median_latency={result.median_latency_s:.4f}s"
     )
 
+    # Clean up the probe model
+    del predict_unit
+    torch.cuda.empty_cache()
+
     return result
+
+
+def _batch_size_fn(requests: list[dict]) -> int:
+    """Compute batch size as sum of atoms across all requests."""
+    return sum(int(r["atomic_data"].natoms.sum()) for r in requests)
 
 
 @serve.deployment(
@@ -241,48 +272,60 @@ def probe_optimal_batch_size(
 class BatchPredictServer:
     """
     Ray Serve deployment that batches incoming inference requests.
+
+    This server always operates in multiplexed mode, loading models on-demand
+    with LRU eviction. Single-model use is just multiplexed with one model_key.
+
+    Request format:
+        {
+            "model_key": str,  # "{checkpoint_path_or_name}:{inference_settings}"
+            "atomic_data": AtomicData,
+            "undo_element_references": bool,
+        }
     """
 
     def __init__(
         self,
-        predict_unit_ref,
         max_batch_size: int | None,
         batch_wait_timeout_s: float | None,
         split_oom_batch: bool = True,
+        max_num_models_per_replica: int = 3,
     ):
         """
-        Initialize with a Ray object reference to a PredictUnit.
+        Initialize the multiplexed batch prediction server.
 
         Args:
-            predict_unit_ref: Ray object reference to an MLIPPredictUnit instance
             max_batch_size: Maximum number of atoms in a batch. If None, batching
-                must be configured via configure_batching() or auto_configure_batching()
-                before running predictions.
-                The actual number of atoms will likely be larger than this as batches
-                are split when num atoms exceeds this value.
-            batch_wait_timeout_s: Timeout in seconds to wait for a prediction.
+                must be configured via configure_batching() before running predictions.
+            batch_wait_timeout_s: Timeout in seconds to wait for a batch.
                 If None, batching must be configured before running predictions.
-            split_oom_batch: If true will split batch if an OOM error is raised
+            split_oom_batch: If true will split batch if an OOM error is raised.
+            max_num_models_per_replica: Maximum number of models to keep in memory
+                per replica. Older models are evicted via LRU when exceeded.
         """
-        self.predict_unit = ray.get(predict_unit_ref)
         self.split_oom_batch = split_oom_batch
+        self._max_num_models_per_replica = max_num_models_per_replica
         self._batching_configured = False
+        self._model_metadata_cache: dict[str, dict] = {}
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if max_batch_size is not None and batch_wait_timeout_s is not None:
             self.configure_batching(max_batch_size, batch_wait_timeout_s)
         elif max_batch_size is not None or batch_wait_timeout_s is not None:
             raise ValueError(
                 "Both max_batch_size and batch_wait_timeout_s must be provided together, "
-                "or both must be None for autobatch configuration."
+                "or both must be None for later configuration."
             )
         else:
             logging.info(
                 "BatchPredictServer initialized without batching configuration. "
-                "Call configure_batching() or use InferenceBatcher.auto_configure_batching() "
-                "before running predictions."
+                "Call configure_batching() before running predictions."
             )
 
-        logging.info("BatchedPredictor initialized with predict_unit from object store")
+        logging.info(
+            f"BatchPredictServer initialized in multiplexed mode "
+            f"(max_models={max_num_models_per_replica}, device={self._device})"
+        )
 
     def configure_batching(
         self,
@@ -294,9 +337,6 @@ class BatchPredictServer:
         Args:
             max_batch_size: Maximum number of atoms in a batch.
             batch_wait_timeout_s: Maximum wait time before processing partial batch.
-
-        Raises:
-            ValueError: If max_batch_size or batch_wait_timeout_s is invalid.
         """
         if max_batch_size is None or max_batch_size <= 0:
             raise ValueError(
@@ -315,113 +355,205 @@ class BatchPredictServer:
             f"batch_wait_timeout_s={batch_wait_timeout_s}"
         )
 
-    def get_predict_unit_attribute(self, attribute_name: str) -> Any:
-        return getattr(self.predict_unit, attribute_name)
-
-    @serve.batch(
-        batch_size_fn=lambda batch: sum(sample.natoms.sum() for sample in batch).item()
-    )
-    async def predict(
-        self, data_list: list[AtomicData], undo_element_references: bool = True
-    ) -> list[dict]:
+    @serve.multiplexed(max_num_models_per_replica=3)
+    async def get_model(self, model_key: str) -> MLIPPredictUnit:
         """
-        Process a batch of AtomicData objects.
+        Load model on demand with LRU eviction.
+
+        model_key format: "{checkpoint_name_or_path}:{inference_settings}"
+        e.g., "uma-s-1p1:default" or "/path/to/model.pt:turbo"
+
+        If checkpoint_name looks like a file path (ends with .pt or contains /),
+        it will be loaded directly from that path.
+        Otherwise, it will be loaded from the pretrained model registry.
+        """
+        from fairchem.core.calculate import pretrained_mlip
+        from fairchem.core.units.mlip_unit import load_predict_unit
+
+        parts = model_key.split(":")
+        checkpoint_name = parts[0]
+        inference_settings = parts[1] if len(parts) > 1 else "default"
+
+        start_time = (
+            torch.cuda.Event(enable_timing=True) if self._device == "cuda" else None
+        )
+        end_time = (
+            torch.cuda.Event(enable_timing=True) if self._device == "cuda" else None
+        )
+
+        if start_time:
+            start_time.record()
+
+        logging.info(f"Loading model '{model_key}'")
+
+        is_local_path = (
+            checkpoint_name.endswith(".pt")
+            or "/" in checkpoint_name
+            or "\\" in checkpoint_name
+        )
+
+        if is_local_path:
+            logging.info(f"Loading local checkpoint from path: {checkpoint_name}")
+            predict_unit = load_predict_unit(
+                checkpoint_name,
+                inference_settings=inference_settings,
+                device=self._device,
+            )
+        else:
+            predict_unit = pretrained_mlip.get_predict_unit(
+                checkpoint_name,
+                inference_settings=inference_settings,
+                device=self._device,
+            )
+
+        self._cache_model_metadata(model_key, predict_unit)
+
+        if end_time:
+            end_time.record()
+            torch.cuda.synchronize()
+            load_time = start_time.elapsed_time(end_time)
+            logging.info(
+                f"Successfully loaded model '{model_key}' in {load_time:.1f}ms"
+            )
+        else:
+            logging.info(f"Successfully loaded model '{model_key}'")
+
+        return predict_unit
+
+    def _cache_model_metadata(self, model_key: str, predict_unit: MLIPPredictUnit):
+        """Cache model metadata for client queries."""
+        self._model_metadata_cache[model_key] = {
+            "form_elem_refs": getattr(predict_unit, "form_elem_refs", {}),
+            "atom_refs": getattr(predict_unit, "atom_refs", {}),
+            "dataset_to_tasks": {
+                name: [
+                    {"name": t.name, "property": t.property, "level": t.level}
+                    for t in tasks
+                ]
+                for name, tasks in predict_unit.dataset_to_tasks.items()
+            },
+        }
+
+    async def fetch_model_metadata(self, model_key: str) -> dict[str, Any]:
+        """
+        Fetch metadata for a model, loading it if necessary.
+
+        Returns cached metadata including dataset_to_tasks, form_elem_refs, atom_refs.
+        """
+        if model_key not in self._model_metadata_cache:
+            await self.get_model(model_key)
+        return self._model_metadata_cache.get(model_key, {})
+
+    @serve.batch(batch_size_fn=_batch_size_fn)
+    async def predict(self, requests: list[dict]) -> list[dict]:
+        """
+        Process a batch of inference requests.
 
         Args:
-            data_list: List of AtomicData objects (automatically batched by Ray Serve)
-            undo_element_references: Whether to undo element references in predictions
+            requests: List of request dicts, each containing:
+                - model_key: str
+                - atomic_data: AtomicData
+                - undo_element_references: bool
 
         Returns:
-            List of prediction dictionaries, one per input
-
-        Raises:
-            RuntimeError: If batching has not been configured.
+            List of prediction dictionaries, one per input request.
         """
         if not self._batching_configured:
             raise RuntimeError(
-                "Batching has not been configured. Call configure_batching() with "
-                "explicit max_batch_size and batch_wait_timeout_s values, or use "
-                "InferenceBatcher.auto_configure_batching() to automatically determine "
-                "optimal parameters before running predictions."
+                "Batching has not been configured. Call configure_batching() "
+                "before running predictions."
             )
+
+        if not requests:
+            return []
+
+        # Group requests by model_key to prevent cross-model batching
+        requests_by_model: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+        for idx, req in enumerate(requests):
+            model_key = req["model_key"]
+            requests_by_model[model_key].append((idx, req))
+
+        # Pre-allocate results array to preserve original ordering
+        results: list[dict | None] = [None] * len(requests)
+
+        # Process each model group separately
+        for model_key, indexed_requests in requests_by_model.items():
+            predict_unit = await self.get_model(model_key)
+
+            indices = [idx for idx, _ in indexed_requests]
+            model_requests = [req for _, req in indexed_requests]
+
+            data_list = [req["atomic_data"] for req in model_requests]
+            undo_refs = model_requests[0].get("undo_element_references", True)
+
+            # Process with OOM recovery
+            split_preds = await self._predict_with_oom_recovery(
+                predict_unit, data_list, undo_refs
+            )
+
+            # Place results back in original positions
+            for idx, pred in zip(indices, split_preds, strict=False):
+                results[idx] = pred
+
+        return results
+
+    async def _predict_with_oom_recovery(
+        self,
+        predict_unit: MLIPPredictUnit,
+        data_list: list[AtomicData],
+        undo_element_references: bool,
+    ) -> list[dict]:
+        """Run inference with OOM recovery by splitting batches."""
         data_deque = deque([data_list])
         prediction_list = []
+
         while len(data_deque) > 0:
             oom = False
-            data_list = data_deque.popleft()
-            batch = atomicdata_list_to_batch(data_list)
+            current_data_list = data_deque.popleft()
+            batch = atomicdata_list_to_batch(current_data_list)
 
             try:
-                predictions = self.predict_unit.predict(
+                predictions = predict_unit.predict(
                     batch, undo_element_references=undo_element_references
                 )
                 prediction_list.extend(self._split_predictions(predictions, batch))
             except torch.OutOfMemoryError as err:
-                print(f"OutOfMemoryError: {err}!!!!!")
+                logging.warning(f"OutOfMemoryError during inference: {err}")
                 if not self.split_oom_batch:
                     raise torch.OutOfMemoryError(
-                        "Reduce max_batch_size or set split_oom_batch=True to automatically split OOM batches."
+                        "Reduce max_batch_size or set split_oom_batch=True."
                     ) from err
 
-                if len(data_list) == 1:
+                if len(current_data_list) == 1:
                     raise torch.OutOfMemoryError(
-                        "Out of memory for a single system left in batch."
+                        "Out of memory for a single system."
                     ) from err
 
-                logging.warning(
-                    "Caught out of memory error. Splitting batch and retrying."
-                )
+                logging.warning("Splitting batch and retrying.")
                 oom = True
                 torch.cuda.empty_cache()
 
             if oom:
-                mid = len(data_list) // 2
-                data_deque.appendleft(data_list[mid:])
-                data_deque.appendleft(data_list[:mid])
+                mid = len(current_data_list) // 2
+                data_deque.appendleft(current_data_list[mid:])
+                data_deque.appendleft(current_data_list[:mid])
 
         return prediction_list
-
-    async def __call__(
-        self, data: AtomicData, undo_element_references: bool = True
-    ) -> dict:
-        """
-        Main entry point for inference requests.
-
-        Args:
-            data: Single AtomicData object
-            undo_element_references: Whether to undo element references in predictions
-
-        Returns:
-            Prediction dictionary for this system
-        """
-        predictions = await self.predict(data, undo_element_references)
-        return predictions
 
     def _split_predictions(
         self,
         predictions: dict,
         batch: AtomicData,
     ) -> list[dict]:
-        """
-        Split batched predictions back into individual system predictions.
-
-        Args:
-            predictions: Dictionary of batched prediction tensors
-            batch: The batched AtomicData used for inference
-
-        Returns:
-            List of prediction dictionaries, one per system
-        """
+        """Split batched predictions back into individual system predictions."""
         split_preds = []
         for i in range(len(batch)):
             system_predictions = {}
 
             for key, pred in predictions.items():
                 if pred.shape[0] == len(batch):
-                    # Per-system prediction
                     system_predictions[key] = pred[i : i + 1]
                 elif pred.shape[0] == len(batch.batch):
-                    # Per-atom prediction
                     mask = batch.batch == i
                     system_predictions[key] = pred[mask]
                 else:
@@ -435,34 +567,60 @@ class BatchPredictServer:
 
         return split_preds
 
+    async def __call__(self, request: dict) -> dict:
+        """
+        Main entry point for inference requests.
+
+        Handles both prediction and metadata requests.
+
+        Args:
+            request: Dict containing either:
+                - For predictions: model_key, atomic_data, undo_element_references
+                - For metadata: request_type="metadata", model_key
+
+        Returns:
+            Prediction dictionary or metadata dictionary.
+        """
+        if request.get("request_type") == "metadata":
+            return await self.fetch_model_metadata(request["model_key"])
+
+        return await self.predict(request)
+
 
 def setup_batch_predict_server(
-    predict_unit: MLIPPredictUnit,
     max_batch_size: int | None = None,
     batch_wait_timeout_s: float | None = None,
     split_oom_batch: bool = True,
     num_replicas: int = 1,
     ray_actor_options: dict | None = None,
-    deployment_name: str = "predict-server",
-    route_prefix: str = "/predict",
+    deployment_name: str = "fairchem-inference",
+    route_prefix: str = "/inference",
+    autoscaling_config: dict | None = None,
+    deployment_config: dict | None = None,
+    max_num_models_per_replica: int = 3,
 ) -> serve.handle.DeploymentHandle:
     """
     Set up and deploy a BatchPredictServer for batched inference.
 
+    The server operates in multiplexed mode, loading models on-demand with LRU eviction.
+
     Args:
-        predict_unit: An MLIPPredictUnit instance to use for batched inference
         max_batch_size: Maximum number of atoms in a batch. If None, batching must
             be configured later via configure_batching() before running predictions.
         batch_wait_timeout_s: Maximum wait time before processing partial batch.
             If None, batching must be configured later.
         split_oom_batch: Whether to split batches that cause OOM errors.
-        num_replicas: Number of deployment replicas for scaling.
-        ray_actor_options: Additional Ray actor options (e.g., {"num_gpus": 1, "num_cpus": 4})
+        num_replicas: Number of deployment replicas (ignored if autoscaling_config provided).
+        ray_actor_options: Ray actor options (e.g., {"num_gpus": 1, "num_cpus": 4}).
         deployment_name: Name for the Ray Serve deployment.
         route_prefix: HTTP route prefix for the deployment.
+        autoscaling_config: Autoscaling configuration dict. If provided, overrides num_replicas.
+            Example: {"min_replicas": 0, "max_replicas": 4, "downscale_delay_s": 60}
+        deployment_config: Additional deployment configuration to merge in.
+        max_num_models_per_replica: Maximum models to keep in memory per replica.
 
     Returns:
-        Ray Serve deployment handle that can be used to initialize BatchServerPredictUnit
+        Ray Serve deployment handle.
     """
     if ray_actor_options is None:
         ray_actor_options = {}
@@ -470,8 +628,7 @@ def setup_batch_predict_server(
     cpus_per_actor = ray_actor_options.get("num_cpus", min(cpu_count(), 8))
     ray_actor_options["num_cpus"] = cpus_per_actor
 
-    if "cuda" in predict_unit.device and "num_gpus" not in ray_actor_options:
-        # assign 1 GPU per replica by default if using GPU device
+    if torch.cuda.is_available() and "num_gpus" not in ray_actor_options:
         ray_actor_options["num_gpus"] = 1
 
     if not ray.is_initialized():
@@ -487,25 +644,107 @@ def setup_batch_predict_server(
     )
     logging.info("Ray Serve started by setup_batch_predict_server")
 
-    predict_unit_ref = ray.put(predict_unit)
-    logging.info("Predict unit stored in Ray object store")
+    # Build deployment options
+    deploy_options = copy.deepcopy(deployment_config) if deployment_config else {}
+    deploy_options["ray_actor_options"] = ray_actor_options
 
-    deployment = BatchPredictServer.options(
-        num_replicas=num_replicas,
-        ray_actor_options=ray_actor_options,
-    ).bind(
-        predict_unit_ref,
+    if autoscaling_config:
+        deploy_options["autoscaling_config"] = autoscaling_config
+        logging.info(f"Autoscaling enabled: {autoscaling_config}")
+    else:
+        deploy_options["num_replicas"] = num_replicas
+
+    deployment = BatchPredictServer.options(**deploy_options).bind(
         max_batch_size=max_batch_size,
         batch_wait_timeout_s=batch_wait_timeout_s,
         split_oom_batch=split_oom_batch,
+        max_num_models_per_replica=max_num_models_per_replica,
     )
 
     handle = serve.run(deployment, name=deployment_name, route_prefix=route_prefix)
 
     logging.info(
-        f"BatchPredictServer deployed with max_batch_size={max_batch_size}, "
-        f"batch_wait_timeout_s={batch_wait_timeout_s}, num_replicas={num_replicas}, "
+        f"BatchPredictServer deployed: max_batch_size={max_batch_size}, "
+        f"batch_wait_timeout_s={batch_wait_timeout_s}, "
+        f"max_num_models_per_replica={max_num_models_per_replica}, "
         f"name={deployment_name}"
     )
 
     return handle
+
+
+def wait_for_serve_ready(
+    app_name: str = "fairchem-inference",
+    poll_interval_seconds: float = 2.0,
+) -> bool:
+    """
+    Wait for Ray Serve to be fully ready to accept requests.
+
+    Blocks until:
+    1. Ray Serve controller is running
+    2. The specified application is deployed and RUNNING
+
+    Args:
+        app_name: Name of the Ray Serve application to wait for.
+        poll_interval_seconds: How often to check status.
+
+    Returns:
+        True if server is ready.
+
+    Raises:
+        RuntimeError: If server fails to deploy.
+    """
+    from ray.serve.schema import ApplicationStatus
+
+    logging.info("Waiting for Ray Serve controller to start...")
+    while True:
+        try:
+            status = serve.status()
+            logging.info("Ray Serve controller is running")
+            break
+        except Exception as e:
+            error_msg = str(e)
+            if (
+                "SERVE_CONTROLLER_ACTOR" in error_msg
+                or "Failed to look up actor" in error_msg
+            ):
+                logging.debug(f"Ray Serve controller not ready yet: {error_msg}")
+                time.sleep(poll_interval_seconds)
+            else:
+                raise
+
+    logging.info(f"Waiting for application '{app_name}' to be ready...")
+    while True:
+        try:
+            status = serve.status()
+
+            if app_name not in status.applications:
+                logging.debug(f"Application '{app_name}' not found yet, waiting...")
+                time.sleep(poll_interval_seconds)
+                continue
+
+            app_status = status.applications[app_name]
+
+            if app_status.status == ApplicationStatus.RUNNING:
+                logging.info(f"Application '{app_name}' is RUNNING and ready")
+                return True
+            elif app_status.status == ApplicationStatus.DEPLOYING:
+                logging.debug(f"Application '{app_name}' is still deploying...")
+                time.sleep(poll_interval_seconds)
+            elif app_status.status in (
+                ApplicationStatus.DEPLOY_FAILED,
+                ApplicationStatus.UNHEALTHY,
+            ):
+                raise RuntimeError(
+                    f"Application '{app_name}' failed to deploy. "
+                    f"Status: {app_status.status}, Message: {app_status.message}"
+                )
+            else:
+                logging.debug(f"Application '{app_name}' status: {app_status.status}")
+                time.sleep(poll_interval_seconds)
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logging.warning(f"Error checking serve status: {e}")
+            time.sleep(poll_interval_seconds)

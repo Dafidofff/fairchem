@@ -8,7 +8,6 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from functools import cached_property
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -17,6 +16,7 @@ from fairchem.core.units.mlip_unit._batch_serve import (
     AutobatchResult,
     probe_optimal_batch_size,
     setup_batch_predict_server,
+    wait_for_serve_ready,
 )
 from fairchem.core.units.mlip_unit.predict import (
     BatchServerPredictUnit,
@@ -36,6 +36,7 @@ __all__ = [
     "BatchServerPredictUnit",
     "MLIPPredictUnit",
     "MLIPWorkerPredictUnit",
+    "wait_for_serve_ready",
 ]
 
 
@@ -172,42 +173,53 @@ def _get_concurrency_backend(
 
 
 class InferenceBatcher:
-    """Batches incoming inference requests.
+    """Batches incoming inference requests using Ray Serve.
 
     This class provides a high-level API for running concurrent simulations
-    with batched inference calls to an AI model. It supports multiple
-    concurrency backends for different use cases.
+    with batched inference calls to AI models. Models are loaded on-demand
+    with LRU eviction, supporting both single-model and multi-model use cases.
 
     Example:
-        >>> predict_unit = MLIPPredictUnit(model_path, device="cuda")
-        >>> with InferenceBatcher(predict_unit, max_batch_size=1024) as batcher:
+        >>> with InferenceBatcher(max_batch_size=1024) as batcher:
+        ...     predict_unit = batcher.get_predict_unit("uma-s-1p1:default")
+        ...     calc = FAIRChemCalculator(predict_unit, task_name="omat")
         ...     # Run concurrent simulations using batcher.executor
         ...     futures = [batcher.executor.submit(run_sim, atoms) for atoms in systems]
 
-    Example with autobatching:
-        >>> predict_unit = MLIPPredictUnit(model_path, device="cuda")
-        >>> data = [AtomicData.from_ase(bulk("Cu"), task_name="omat")]
-        >>> with InferenceBatcher(predict_unit) as batcher:
-        ...     # Probe for optimal batch size using representative data
-        ...     batcher.auto_configure_batching(data)
-        ...     # Now run simulations with optimal batch size
-        ...     futures = [batcher.executor.submit(run_sim, atoms) for atoms in systems]
+    Example with multiple models:
+        >>> with InferenceBatcher(max_batch_size=1024, max_num_models_per_replica=3) as batcher:
+        ...     unit_small = batcher.get_predict_unit("uma-s-1p1:default")
+        ...     unit_large = batcher.get_predict_unit("uma-l-1p1:default")
+        ...     calc_small = FAIRChemCalculator(unit_small, task_name="omat")
+        ...     calc_large = FAIRChemCalculator(unit_large, task_name="omat")
+
+    Example with autoscaling:
+        >>> batcher = InferenceBatcher(
+        ...     autoscaling_config={
+        ...         "min_replicas": 0,
+        ...         "max_replicas": 8,
+        ...         "downscale_delay_s": 60,
+        ...     }
+        ... )
+        >>> predict_unit = batcher.get_predict_unit("uma-s-1p1:default")
     """
 
     def __init__(
         self,
-        predict_unit: MLIPPredictUnit,
         max_batch_size: int | None = None,
         batch_wait_timeout_s: float | None = None,
-        split_oom_batch: bool = False,
+        split_oom_batch: bool = True,
         num_replicas: int = 1,
         concurrency_backend: Literal["threads", "processes", "ray-actors"] = "threads",
         concurrency_backend_options: dict | None = None,
         ray_actor_options: dict | None = None,
+        autoscaling_config: dict | None = None,
+        deployment_config: dict | None = None,
+        max_num_models_per_replica: int = 3,
+        deployment_name: str = "fairchem-inference",
     ):
         """
         Args:
-            predict_unit: The predict unit to use for inference.
             max_batch_size: Maximum number of atoms in a batch. If None, must call
                 auto_configure_batching() before running predictions to automatically
                 determine optimal parameters.
@@ -216,7 +228,8 @@ class InferenceBatcher:
                 Note: Both max_batch_size and batch_wait_timeout_s must be provided
                 together, or both must be None for autobatch configuration.
             split_oom_batch: If True, split and retry on OOM errors.
-            num_replicas: The number of replicas to use for inference.
+            num_replicas: The number of replicas to use for inference (ignored if
+                autoscaling_config is provided).
             concurrency_backend: The concurrency backend to use for running simulations:
                 - "threads": ThreadPoolExecutor (default). Best for I/O-bound tasks.
                     Options: max_workers (int).
@@ -228,21 +241,30 @@ class InferenceBatcher:
             concurrency_backend_options: Options to pass to the concurrency backend.
                 See backend descriptions above for available options.
             ray_actor_options: Options to pass to the Ray actor running the batch server.
+            autoscaling_config: Autoscaling configuration for the deployment.
+                Example: {"min_replicas": 0, "max_replicas": 4, "downscale_delay_s": 60}
+            deployment_config: Additional deployment configuration to merge in.
+            max_num_models_per_replica: Maximum number of models to keep in memory
+                per replica. Older models are evicted via LRU when exceeded.
+            deployment_name: Name for the Ray Serve deployment.
 
         Raises:
             ValueError: If only one of max_batch_size or batch_wait_timeout_s is provided.
         """
-        self.predict_unit = predict_unit
         self.num_replicas = num_replicas
         self._concurrency_backend = concurrency_backend
+        self._deployment_name = deployment_name
 
         self.predict_server_handle = setup_batch_predict_server(
-            predict_unit=self.predict_unit,
             max_batch_size=max_batch_size,
             batch_wait_timeout_s=batch_wait_timeout_s,
             split_oom_batch=split_oom_batch,
             num_replicas=self.num_replicas,
             ray_actor_options=ray_actor_options or {},
+            deployment_name=deployment_name,
+            autoscaling_config=autoscaling_config,
+            deployment_config=deployment_config,
+            max_num_models_per_replica=max_num_models_per_replica,
         )
 
         if concurrency_backend_options is None:
@@ -269,16 +291,25 @@ class InferenceBatcher:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
-    @cached_property
-    def batch_predict_unit(self) -> BatchServerPredictUnit:
+    def get_predict_unit(self, model_key: str) -> BatchServerPredictUnit:
+        """Get a predict unit for the specified model.
+
+        Args:
+            model_key: Model identifier in format "{checkpoint_path_or_name}:{inference_settings}"
+                e.g., "uma-s-1p1:default" or "/path/to/model.pt:turbo"
+
+        Returns:
+            BatchServerPredictUnit configured for the specified model.
+        """
         return BatchServerPredictUnit(
             server_handle=self.predict_server_handle,
-            predict_unit=self.predict_unit,
+            model_key=model_key,
         )
 
     def auto_configure_batching(
         self,
-        data: list[AtomicData],
+        model_key: str,
+        probe_data: list[AtomicData],
         config: AutobatchConfig | None = None,
     ) -> AutobatchResult:
         """Probe for optimal batch size and timeout using representative data.
@@ -287,7 +318,8 @@ class InferenceBatcher:
         then configures the server with optimal parameters.
 
         Args:
-            data: List of AtomicData objects to use for probing. The data
+            model_key: Model to probe with in format "{checkpoint}:{settings}".
+            probe_data: List of AtomicData objects to use for probing. The data
                 will be repeated if needed to reach larger batch sizes during probing.
             config: Autobatch configuration. Uses defaults if None.
 
@@ -298,8 +330,8 @@ class InferenceBatcher:
             config = AutobatchConfig()
 
         result = probe_optimal_batch_size(
-            predict_unit=self.predict_unit,
-            probe_data=data,
+            model_key=model_key,
+            probe_data=probe_data,
             config=config,
         )
 

@@ -837,24 +837,30 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
 
     This provides a clean interface compatible with MLIPPredictUnitProtocol
     while leveraging Ray Serve's batching capabilities under the hood.
+
+    The server operates in multiplexed mode, so a model_key must be provided
+    to specify which model to use for inference.
     """
 
     def __init__(
         self,
         server_handle,
-        predict_unit: MLIPPredictUnit,
+        model_key: str,
     ):
         """
         Args:
             server_handle: Ray Serve deployment handle for BatchPredictServer
-            predict_unit: Local MLIPPredictUnit used for input validation.
-                Validation must run locally because it mutates atoms.info.
+            model_key: Model identifier in format "{checkpoint_path_or_name}:{inference_settings}"
+                e.g., "uma-s-1p1:default" or "/path/to/model.pt:turbo"
         """
-        self.server_handle = server_handle
-        self._predict_unit = predict_unit
+        self._handle = server_handle
+        self._model_key = model_key
+        self._cached_metadata: dict | None = None
 
     def predict(self, data: AtomicData, undo_element_references: bool = True) -> dict:
         """
+        Run inference via Ray Serve.
+
         Args:
             data: AtomicData object (single system)
             undo_element_references: Whether to undo element references
@@ -862,36 +868,55 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         Returns:
             Prediction dictionary
         """
-        result = self.server_handle.predict.remote(
-            data, undo_element_references
-        ).result()
+        request = {
+            "model_key": self._model_key,
+            "atomic_data": data,
+            "undo_element_references": undo_element_references,
+        }
+        result = self._handle.remote(request).result()
         return result
+
+    def _fetch_metadata(self):
+        """Fetch and cache metadata from server."""
+        if self._cached_metadata is not None:
+            return
+
+        request = {"request_type": "metadata", "model_key": self._model_key}
+        self._cached_metadata = self._handle.remote(request).result()
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         """
         Validate and set defaults for calculator input data.
 
-        Runs locally (not via Ray Serve) because validation mutates atoms.info.
+        This fetches metadata from the server to perform validation.
         """
-        self._predict_unit.validate_atoms_data(atoms, task_name)
+        self._fetch_metadata()
+
+        dataset_to_tasks = self._cached_metadata.get("dataset_to_tasks", {})
+
+        if task_name not in dataset_to_tasks:
+            logging.warning(
+                f"task_name '{task_name}' not found in model's dataset_to_tasks. "
+                f"Available tasks: {list(dataset_to_tasks.keys())}"
+            )
+
+        if "dataset" not in atoms.info:
+            atoms.info["dataset"] = task_name
 
     @property
     def dataset_to_tasks(self) -> dict:
-        return self.server_handle.get_predict_unit_attribute.remote(
-            "dataset_to_tasks"
-        ).result()
+        self._fetch_metadata()
+        return self._cached_metadata.get("dataset_to_tasks", {})
 
     @property
     def atom_refs(self) -> dict | None:
-        return self.server_handle.get_predict_unit_attribute.remote(
-            "atom_refs"
-        ).result()
+        self._fetch_metadata()
+        return self._cached_metadata.get("atom_refs")
 
     @property
-    def inference_settings(self) -> InferenceSettings:
-        return self.server_handle.get_predict_unit_attribute.remote(
-            "inference_settings"
-        ).result()
+    def form_elem_refs(self) -> dict:
+        self._fetch_metadata()
+        return self._cached_metadata.get("form_elem_refs", {})
 
 
 @ray.remote

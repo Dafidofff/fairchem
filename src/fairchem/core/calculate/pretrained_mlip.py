@@ -17,7 +17,10 @@ from omegaconf import OmegaConf
 
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
-from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
+# Lazy — MLIPPredictUnit and load_predict_unit pull in ray via predict.py.
+# Import them inside get_predict_unit / load_predict_unit callers if needed.
+MLIPPredictUnit = None
+load_predict_unit = None
 
 if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import InferenceSettings

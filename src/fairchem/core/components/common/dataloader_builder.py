@@ -38,6 +38,8 @@ def get_dataloader(
         pin_memory=True,
         batch_sampler=batch_sampler,
         multiprocessing_context="fork" if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     logging.info("get_dataloader::Done!")
     return dataloader

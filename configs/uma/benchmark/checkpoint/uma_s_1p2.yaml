@@ -1,0 +1,2 @@
+model_name: uma_s_1p2
+ckpt_path: /projects/prjs1814/uma_data/ckpt/uma-s-1p2/checkpoints/uma-s-1p2.pt

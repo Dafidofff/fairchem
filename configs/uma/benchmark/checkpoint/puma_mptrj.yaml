@@ -1,0 +1,5 @@
+# P-UMA fine-tuned on MPtrj + sAlex (the DFT-consistent setting UMA uses for
+# the Matbench Discovery numbers in Table 4 / Table 16). Highest-step converged
+# checkpoint from the uma_ft_mptrj run.
+model_name: puma_mptrj_step35000
+ckpt_path: /projects/prjs1814/uma_data/runs/uma_ft_mptrj/202605-2218-4744-7164/checkpoints/step_35000/inference_ckpt.pt

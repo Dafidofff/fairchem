@@ -1,0 +1,4 @@
+# P-UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture. Highest-step converged
+# checkpoint from the puma_ft_oam run.
+model_name: puma_oam_step34000
+ckpt_path: /projects/prjs1814/uma_data/runs/puma_ft_oam/202605-2803-2840-9cc7/checkpoints/step_34000/inference_ckpt.pt

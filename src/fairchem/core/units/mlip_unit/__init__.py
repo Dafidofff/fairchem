@@ -73,6 +73,10 @@ def load_predict_unit(
             seed=seed,
         )
     else:
+        # Imported locally (like ParallelMLIPPredictUnit above) to keep ray out
+        # of module import; the module-level MLIPPredictUnit stub is None.
+        from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+
         return MLIPPredictUnit(
             path,
             device=device,

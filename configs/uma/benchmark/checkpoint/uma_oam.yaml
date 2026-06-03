@@ -1,0 +1,5 @@
+# UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture (the uma_ft_oam run, as
+# opposed to the P-UMA puma_ft_oam run in puma_oam.yaml). Final / lowest-val-loss
+# checkpoint (val/loss monotonically decreasing to step_85000).
+model_name: uma_oam_step85000
+ckpt_path: /projects/prjs1814/uma_data/runs/uma_ft_oam/202605-2616-5704-efce/checkpoints/step_85000/inference_ckpt.pt

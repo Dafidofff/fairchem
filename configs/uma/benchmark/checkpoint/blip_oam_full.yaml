@@ -1,0 +1,15 @@
+# BLIP-UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture — FULL 1-epoch run.
+# Job 23880387, run 202606-1516-5659-64bb; COMPLETED 2026-06-17.
+# ~46 h train + ~3 h eval (~2.2 s/step × 74,879 steps); 4× H100-NVL.
+# True BLIP ELBO training: single-sample L1(E/atom,F) + λ·KL(posterior‖prior).
+# All l=0 (invariant) Linears made Bayesian: energy head (node) + csd embed (graph).
+#
+# NOTE: exported in *wrapper* format (_target_: blip_uma.model_init.initialize_blip_uma_model,
+# state dict under model.* + posterior.*). Converted to stock HydraModel format with
+# experiments/uma/scripts/matbench/convert_blip_inference_ckpt.py (MAP weights only;
+# posterior E_ψ stripped). Smoke test passed (Cu4 E=-16.2484 eV). To regenerate:
+#   python experiments/uma/scripts/matbench/convert_blip_inference_ckpt.py \
+#     --wrapper-ckpt .../202606-1516-5659-64bb/checkpoints/final/inference_ckpt.pt \
+#     --template-ckpt .../202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt
+model_name: blip_oam_full
+ckpt_path: /projects/prjs1814/uma_data/runs/blip_ft_oam/202606-1516-5659-64bb/checkpoints/final/inference_ckpt_stock.pt

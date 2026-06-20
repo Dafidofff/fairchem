@@ -1,0 +1,18 @@
+# P-UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture — FULL 1-epoch run.
+# Job 23665958 (resume of 23639874), run 202606-1109-3255-8333; COMPLETED
+# 2026-06-15 13:22. Same recipe as uma_oam_full + noise injection + fair-CRPS
+# loss (K=2 training samples). checkpoints/final is the epoch-end checkpoint.
+#
+# NOTE: like all puma_ft runs, this exported inference_ckpt.pt in *wrapper*
+# format (_target_: p_mlip.puma_init.initialize_puma_model, state dict under
+# model.* + noise_projs.*), which the stock predict path can't load. We
+# re-exported the deterministic (noise-free MAP) model to stock HydraModel
+# format with experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py
+# (template = uma_oam_full stock ckpt); point at that file. Smoke test passed.
+# To regenerate:
+#   python experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py \
+#     --wrapper-ckpt .../202606-1109-3255-8333/checkpoints/final/inference_ckpt.pt \
+#     --template-ckpt .../202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt
+# Supersedes puma_oam.yaml (the partial step_34000 checkpoint, F1=0.835 prelim).
+model_name: puma_oam_full
+ckpt_path: /projects/prjs1814/uma_data/runs/puma_ft_oam/202606-1109-3255-8333/checkpoints/final/inference_ckpt_stock.pt

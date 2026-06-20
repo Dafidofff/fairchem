@@ -38,7 +38,15 @@ job:
       account: ${cluster.account}
       partition: ${cluster.partition}
       mem_gb: ${cluster.mem_gb}
-      timeout_hr: 24
+      # Each array task relaxes ~1,004 WBM structures in ~0.8-1.5 h (some chunks
+      # with larger structures / more FIRE steps run longer). 4 h gives a safe
+      # margin while keeping the SBU *reservation* honest: Snellius bills the
+      # estimated max at the requested walltime, so the old 24 h made the full
+      # run reserve ~786k SBU (256 x 24 h x 128 SBU/h) even though it actually
+      # costs ~30-40k. A realistic cap also backfills faster. NOTE: Snellius
+      # denies user-initiated TimeLimit reductions on already-submitted jobs, so
+      # this only helps runs launched *after* editing it.
+      timeout_hr: 4
   # No logger: metrics are still saved to ${run_dir}/.../results as CSV/JSON.
 
 runner:

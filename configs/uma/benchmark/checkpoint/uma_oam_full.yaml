@@ -1,0 +1,8 @@
+# UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture — FULL 1-epoch run.
+# Job 23639873, run 202606-1017-3140-fabc; COMPLETED 2026-06-14.
+# 74,879 steps = 1 full epoch; final eval val/loss_mae=2.3257 (epoch-end eval was
+# the new best, so checkpoints/best == checkpoints/final). Stock export format
+# (vanilla UMA-ft, no P-UMA wrapper) — loads directly, no conversion needed.
+# Supersedes uma_oam.yaml (the partial step_85000 checkpoint, F1=0.905 preliminary).
+model_name: uma_oam_full
+ckpt_path: /projects/prjs1814/uma_data/runs/uma_ft_oam/202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt

@@ -1,0 +1,13 @@
+# P-UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture. Highest-step converged
+# checkpoint from the puma_ft_oam run.
+#
+# NOTE: this run exported its inference_ckpt.pt in *wrapper* format
+# (_target_: p_mlip.puma_init.initialize_puma_model, state dict under model.* +
+# noise_projs.*), which the stock predict path can't load. We re-exported the
+# deterministic (noise-free MAP) model to stock HydraModel format with
+# experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py; point at that
+# file. (puma_mptrj / uma_oam already exported in stock format, so they need no
+# conversion.) To regenerate: run that script with --wrapper-ckpt
+# .../step_34000/inference_ckpt.pt --template-ckpt <any stock puma ckpt>.
+model_name: puma_oam_step34000
+ckpt_path: /projects/prjs1814/uma_data/runs/puma_ft_oam/202605-2803-2840-9cc7/checkpoints/step_34000/inference_ckpt_stock.pt

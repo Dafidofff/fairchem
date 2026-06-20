@@ -16,7 +16,9 @@ from fairchem.core.units.mlip_unit.api.inference import (
     InferenceSettings,
     guess_inference_settings,
 )
-from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+# Lazy — avoid pulling in ray at import time.
+# from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+MLIPPredictUnit = None
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -71,6 +73,10 @@ def load_predict_unit(
             seed=seed,
         )
     else:
+        # Imported locally (like ParallelMLIPPredictUnit above) to keep ray out
+        # of module import; the module-level MLIPPredictUnit stub is None.
+        from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+
         return MLIPPredictUnit(
             path,
             device=device,

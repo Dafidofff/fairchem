@@ -22,8 +22,11 @@ warnings.filterwarnings(
 )
 
 from fairchem.core._config import clear_cache
-from fairchem.core.calculate import pretrained_mlip
-from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+
+# These are loaded lazily to avoid pulling in ray/serve at import time.
+# Import directly if needed: from fairchem.core.calculate import pretrained_mlip
+pretrained_mlip = None
+FAIRChemCalculator = None
 
 try:
     __version__ = version("fairchem.core")

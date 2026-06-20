@@ -1,0 +1,11 @@
+data_root_dir: /projects/prjs1814/uma_data
+checkpoint_root_dir: /projects/prjs1814/uma_data/ckpt
+run_dir: /projects/prjs1814/uma_data/runs/matbench
+account: gusei16306
+qos: ""
+partition: gpu_a100
+mode: LOCAL
+device: CUDA
+ranks_per_node: 1
+debug: True
+mem_gb: 120

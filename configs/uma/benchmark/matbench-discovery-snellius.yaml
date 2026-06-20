@@ -1,0 +1,84 @@
+# Matbench Discovery (WBM) relaxation benchmark, wired for Snellius + P-UMA.
+#
+# Reproduces UMA's Table 4 / Table 16 "Matbench" columns: relax every WBM
+# initial structure with FIRE + FrechetCellFilter, then score thermodynamic
+# stability (F1, DAF, precision, accuracy) and geometry RMSD via
+# MaterialsDiscoveryReducer.
+#
+# Differs from the stock matbench-discovery-discovery.yaml only in:
+#   - defaults to the snellius_a100 cluster (real data_root_dir / partition)
+#   - checkpoint is left to be chosen on the CLI (no public uma_sm_mpa here)
+#   - WandB logging disabled (metrics are still written to results_dir as CSV)
+#   - array-job count sized for our partition rather than 2000
+#
+# Run (pick the checkpoint each time):
+#   fairchem -c configs/uma/benchmark/matbench-discovery-snellius.yaml \
+#       checkpoint=uma_s_1p2
+#   fairchem -c configs/uma/benchmark/matbench-discovery-snellius.yaml \
+#       checkpoint=puma_mptrj
+#   fairchem -c configs/uma/benchmark/matbench-discovery-snellius.yaml \
+#       checkpoint=puma_oam
+defaults:
+  - cluster: snellius_a100
+  - checkpoint: puma_mptrj
+  - _self_
+
+benchmark_name: matbench-discovery
+
+job:
+  run_name: ${checkpoint.model_name}
+  run_dir: ${cluster.run_dir}
+  device_type: ${cluster.device}
+  debug: ${cluster.debug}
+  scheduler:
+    mode: ${cluster.mode}
+    distributed_init_method: FILE
+    num_array_jobs: 256
+    slurm:
+      account: ${cluster.account}
+      partition: ${cluster.partition}
+      mem_gb: ${cluster.mem_gb}
+      # Each array task relaxes ~1,004 WBM structures in ~0.8-1.5 h (some chunks
+      # with larger structures / more FIRE steps run longer). 4 h gives a safe
+      # margin while keeping the SBU *reservation* honest: Snellius bills the
+      # estimated max at the requested walltime, so the old 24 h made the full
+      # run reserve ~786k SBU (256 x 24 h x 128 SBU/h) even though it actually
+      # costs ~30-40k. A realistic cap also backfills faster. NOTE: Snellius
+      # denies user-initiated TimeLimit reductions on already-submitted jobs, so
+      # this only helps runs launched *after* editing it.
+      timeout_hr: 4
+  # No logger: metrics are still saved to ${run_dir}/.../results as CSV/JSON.
+
+runner:
+  _target_: fairchem.core.components.calculate.RelaxationRunner
+  calculator:
+    # NOTE: this vendored fairchem (commit 0ddc2e12f "Lazy-load ray imports")
+    # sets fairchem.core.FAIRChemCalculator = None at import time, so the stock
+    # configs' target resolves to None and crashes. Point at the real class
+    # instead; from_model_checkpoint is a @classmethod on it.
+    _target_: fairchem.core.calculate.ase_calculator.FAIRChemCalculator.from_model_checkpoint
+    name_or_path: ${checkpoint.ckpt_path}
+    task_name: omat
+  input_data:
+    _target_: fairchem.core.datasets.atoms_sequence.AtomsDatasetSequence
+    dataset:
+      _target_: fairchem.core.datasets.ase_datasets.AseDBDataset
+      config:
+        src: ${cluster.data_root_dir}/materials/matbench-discovery/WBM_IS2RE.aselmdb
+  save_relaxed_atoms: True
+  calculate_properties: ["energy"]
+  fmax: 0.02
+  steps: 500
+  optimizer_cls:
+    _target_: ase.optimize.FIRE
+    _partial_: True
+  cell_filter_cls:
+    _target_: ase.filters.FrechetCellFilter
+    _partial_: True
+
+reducer:
+  _target_: fairchem.core.components.benchmark.MaterialsDiscoveryReducer
+  benchmark_name: ${benchmark_name}
+  target_data_path: ${cluster.data_root_dir}/materials/matbench-discovery/2023-12-13-wbm-summary.csv.gz
+  cse_data_path: ${cluster.data_root_dir}/materials/matbench-discovery/2022-10-19-wbm-computed-structure-entries.jsonl.gz
+  elemental_references_path: ${cluster.data_root_dir}/materials/matbench-discovery/2023-02-07-mp-elemental-reference-entries.json.gz

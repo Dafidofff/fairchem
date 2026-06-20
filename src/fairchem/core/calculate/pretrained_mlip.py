@@ -17,7 +17,13 @@ from omegaconf import OmegaConf
 
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
-from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
+# MLIPPredictUnit is kept lazy (it pulls in ray via predict.py and is only used
+# as a return-type annotation here). load_predict_unit, however, is invoked at
+# runtime by get_predict_unit() below and by FAIRChemCalculator.from_model_checkpoint;
+# the original "set to None and import lazily in callers" left those call sites
+# calling None(). It is import-safe (ray-free) on its own, so bind it here.
+MLIPPredictUnit = None
+from fairchem.core.units.mlip_unit import load_predict_unit
 
 if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import InferenceSettings

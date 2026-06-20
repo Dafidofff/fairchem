@@ -14,7 +14,6 @@ import time
 from datetime import timedelta
 from typing import Any, TypeVar
 
-import ray
 import torch
 import torch.distributed as dist
 from torch.distributed.elastic.utils.distributed import get_free_port
@@ -175,8 +174,12 @@ def cleanup() -> None:
 
 def cleanup_gp_ray():
     """Useful for cleaning up GP with ray"""
-    if ray.is_initialized():
-        ray.shutdown()
+    try:
+        import ray  # lazy — ray is optional at import time
+        if ray.is_initialized():
+            ray.shutdown()
+    except ImportError:
+        pass
     cleanup()
     if gp_utils.initialized():
         gp_utils.cleanup_gp()

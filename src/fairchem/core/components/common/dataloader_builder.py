@@ -37,6 +37,10 @@ def get_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         batch_sampler=batch_sampler,
+        # "fork" avoids lmdb.Environment pickle error under Python 3.11 spawn
+        multiprocessing_context="fork" if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     logging.info("get_dataloader::Done!")
     return dataloader

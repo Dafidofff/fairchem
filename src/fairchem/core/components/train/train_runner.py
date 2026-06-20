@@ -69,6 +69,55 @@ def get_most_recent_viable_checkpoint_path(checkpoint_dir: str | None) -> str | 
     return most_recent_viable_checkpoint
 
 
+class BestCheckpointCallback(Callback):
+    """Save a 'best/' checkpoint whenever the validation loss improves.
+
+    Must be registered as a callback in the runner config.  The runner wires
+    up save_callback / checkpoint_dir automatically (same pattern as
+    TrainCheckpointCallback).
+    """
+
+    def __init__(self):
+        self.best_val_loss: float = float("inf")
+        self.save_callback = None
+        self.checkpoint_dir = None
+
+    def set_runner_callbacks(
+        self, save_callback: callable, load_callback: callable, checkpoint_dir: str
+    ) -> None:
+        self.save_callback = save_callback
+        self.checkpoint_dir = checkpoint_dir
+
+    def on_eval_epoch_end(self, state: "State", unit) -> None:
+        if self.save_callback is None or self.checkpoint_dir is None:
+            return
+        val_loss = self._get_val_loss(unit)
+        if val_loss is None:
+            return
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            best_path = os.path.join(self.checkpoint_dir, "best")
+            self.save_callback(best_path)
+            if distutils.is_master():
+                logging.info(
+                    f"BestCheckpointCallback: new best val loss {val_loss:.6f} "
+                    f"— checkpoint saved to {best_path}"
+                )
+
+    @staticmethod
+    def _get_val_loss(unit) -> float | None:
+        # MLIPTrainEvalUnit stores val loss in eval_unit.total_loss_metrics.metric
+        try:
+            return unit.eval_unit.total_loss_metrics.metric
+        except AttributeError:
+            pass
+        # PUMATrainEvalUnit exposes last_val_loss directly
+        try:
+            return unit.last_val_loss
+        except AttributeError:
+            return None
+
+
 class TrainCheckpointCallback(Callback):
     def __init__(
         self,
@@ -155,6 +204,13 @@ class TrainEvalRunner(Runner):
                 self.load_state,
                 self.job_config.metadata.checkpoint_dir,
             )
+        for cb in self.callbacks:
+            if isinstance(cb, BestCheckpointCallback):
+                cb.set_runner_callbacks(
+                    self.save_state,
+                    self.load_state,
+                    self.job_config.metadata.checkpoint_dir,
+                )
 
         fit(
             self.train_eval_unit,

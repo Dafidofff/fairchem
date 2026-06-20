@@ -1,0 +1,19 @@
+# Per-Atom-PUMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture — FULL 1-epoch run.
+# Job 23933272, run 202606-1616-0927-226a; COMPLETED 2026-06-20 19:48 CEST.
+# Same recipe as puma_oam_full (Exp 2) with noise_mode=per_atom: one independent
+# noise vector per atom instead of one per structure. Fixes Jacobian-sum cancellation
+# that caused sigma≈0 on natoms≤4 structures (the root cause of Exp 2 UQ ρ=0.198).
+# See experiments/uma/puma_ablations.md §3.1.
+#
+# NOTE: like all puma_ft runs, this exported inference_ckpt.pt in *wrapper*
+# format (_target_: p_mlip.puma_init.initialize_puma_model, state dict under
+# model.* + noise_projs.*), which the stock predict path can't load. We
+# re-exported the deterministic (noise-free MAP) model to stock HydraModel
+# format with experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py
+# (template = uma_oam_full stock ckpt); smoke test passed (Cu4 E=−16.2367 eV).
+# To regenerate:
+#   python experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py \
+#     --wrapper-ckpt .../202606-1616-0927-226a/checkpoints/final/inference_ckpt.pt \
+#     --template-ckpt .../202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt
+model_name: per_atom_puma_oam_full
+ckpt_path: /projects/prjs1814/uma_data/runs/per_atom_puma_ft_oam/202606-1616-0927-226a/checkpoints/final/inference_ckpt_stock.pt

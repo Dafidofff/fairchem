@@ -1,0 +1,6 @@
+# Phase-2d ablation (hybrid_double_noise_small) — small 250k-subset 1-epoch fine-tune.
+# Stock (deterministic MAP) re-export of the wrapper inference_ckpt via
+# convert_puma_inference_ckpt.py (template = uma_oam_full). Used for the reduced
+# WBM-subset matbench relaxation. See experiments/uma/tracker.md "Phase 2d".
+model_name: abl_hybrid_double_noise_small
+ckpt_path: /projects/prjs1814/uma_data/runs/ablations/hybrid_double_noise_small/202606-2423-0408-626d/checkpoints/final/inference_ckpt_stock.pt

@@ -1,0 +1,21 @@
+# Hybrid-PUMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture — FULL 1-epoch run.
+# Experiment 2c from puma_ablations.md. noise_mode=hybrid: per-structure z injected
+# at 4× backbone blocks (same sites as Exp 2 per_graph) AND at
+# output_heads["efs"].energy_block[0] (same site as Exp 2b energy_head).
+# Fixes both Cause A (Jacobian cancellation, via energy-head floor) and
+# Cause B (learned null subspace). Backbone injection preserved for structural
+# uncertainty propagation on larger structures.
+# Run dir: /projects/prjs1814/uma_data/runs/hybrid_puma_ft_oam/202606-1620-4419-139c
+#
+# NOTE: like all puma_ft runs, this exported inference_ckpt.pt in *wrapper*
+# format (_target_: p_mlip.puma_init.initialize_puma_model, state dict under
+# model.* + noise_projs.*), which the stock predict path can't load. We
+# re-exported the deterministic (noise-free MAP) model to stock HydraModel
+# format with experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py
+# (template = uma_oam_full stock ckpt).
+# To regenerate:
+#   python experiments/uma/scripts/matbench/convert_puma_inference_ckpt.py \
+#     --wrapper-ckpt .../202606-1620-4419-139c/checkpoints/final/inference_ckpt.pt \
+#     --template-ckpt .../202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt
+model_name: hybrid_puma_oam_full
+ckpt_path: /projects/prjs1814/uma_data/runs/hybrid_puma_ft_oam/202606-1620-4419-139c/checkpoints/final/inference_ckpt_stock.pt

@@ -1,0 +1,6 @@
+# Phase-2d ablation (energy_noise_only_small) — small 250k-subset 1-epoch fine-tune.
+# Stock (deterministic MAP) re-export of the wrapper inference_ckpt via
+# convert_puma_inference_ckpt.py (template = uma_oam_full). Used for the reduced
+# WBM-subset matbench relaxation. See experiments/uma/tracker.md "Phase 2d".
+model_name: abl_energy_noise_only_small
+ckpt_path: /projects/prjs1814/uma_data/runs/ablations/energy_noise_only_small/202606-2423-0413-154a/checkpoints/final/inference_ckpt_stock.pt

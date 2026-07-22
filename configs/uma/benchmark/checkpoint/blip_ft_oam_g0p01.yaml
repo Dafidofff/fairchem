@@ -1,0 +1,14 @@
+# BLIP-UMA fine-tuned on the OAM (OMat/Alex/MPtrj) mixture, gamma=0.01 — FULL 1-epoch run.
+# Job 24725560 (final segment of a resumed chain), run 202607-1814-0220-c773;
+# COMPLETED 2026-07-20. 74,879 steps, backbone_gating=True, freeze_host=False.
+#
+# NOTE: exported in *wrapper* format (_target_: blip_uma.model_init.initialize_blip_uma_model,
+# state dict under model.* + posterior.* + _frozen_backbone.*). Converted to stock
+# HydraModel format with experiments/uma/scripts/matbench/convert_blip_inference_ckpt.py
+# (MAP weights only; posterior E_ψ + frozen-backbone copy stripped). Smoke test passed
+# (Cu4 E=-16.2440 eV). To regenerate:
+#   python experiments/uma/scripts/matbench/convert_blip_inference_ckpt.py \
+#     --wrapper-ckpt .../blip_ft_oam_g0.01/202607-1814-0220-c773/checkpoints/final/inference_ckpt.pt \
+#     --template-ckpt .../uma_ft_oam/202606-1017-3140-fabc/checkpoints/final/inference_ckpt.pt
+model_name: blip_ft_oam_g0p01
+ckpt_path: /projects/prjs1814/uma_data/runs/blip_ft_oam_g0.01/202607-1814-0220-c773/checkpoints/final/inference_ckpt_stock.pt
